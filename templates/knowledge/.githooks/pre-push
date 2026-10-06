@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Pushes to an encrypted (gcrypt) remote must go through scripts/kb-push, which rebases first.
+# A plain `git push` from a stale clone would silently drop other clones' commits. If you don't
+# use an encrypted remote, you don't need this hook; it only acts on a `gcrypt::` remote URL.
+[[ "$2" == gcrypt::* ]] || exit 0   # plain remotes, and gcrypt's own inner push, pass through
+[ "${KB_PUSH:-}" = 1 ] && exit 0
+echo "pre-push: push trellis-knowledge with scripts/kb-push, not git push (see scripts/kb-push)" >&2
+exit 1

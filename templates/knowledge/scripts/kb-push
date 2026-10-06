@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Push trellis-knowledge. If your remote is encrypted (e.g. git-remote-gcrypt), it may accept a
+# push that doesn't contain the remote's newer commits and silently drop them. So: one push at a
+# time on this machine, and never push unless the remote's tip is already in HEAD. If your remote
+# is a plain git host, you can drop this script and the pre-push hook and just use `git push`.
+set -euo pipefail
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+branch=$(git symbolic-ref --short HEAD)
+exec 9>"$(git rev-parse --git-common-dir)/kb-push.lock"
+flock -w 300 9 || { echo "kb-push: another kb-push has held the lock for 5 minutes; check for a hung push" >&2; exit 1; }
+git fetch -q origin
+tip=$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)
+if [ -n "$tip" ] && ! git merge-base --is-ancestor "$tip" HEAD; then
+  # Only when another machine pushed first. This rebase autostashes the working tree, which can
+  # include other sessions' uncommitted edits; they are restored afterwards unless a conflict stops it.
+  echo "kb-push: origin/$branch has commits from elsewhere; rebasing onto them" >&2
+  if ! git rebase -q --autostash "origin/$branch"; then
+    # Never leave the shared clone mid-rebase: abort restores HEAD and the autostashed edits.
+    git rebase --abort
+    echo "kb-push: rebasing onto origin/$branch conflicts; aborted, nothing pushed, clone restored. Merge by hand: git pull --rebase origin $branch" >&2
+    exit 1
+  fi
+fi
+KB_PUSH=1 git push -q origin "$branch"
