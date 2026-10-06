@@ -1,0 +1,4 @@
+\bjdoe\b
+jdoe@example\.com
+\.home\.arpa\b
+192\.168\.[0-9]+\.[0-9]+

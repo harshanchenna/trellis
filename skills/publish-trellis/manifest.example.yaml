@@ -1,0 +1,34 @@
+# Illustrative slice of an allowlist manifest for a downstream-publishing skill (see
+# skills/publish-trellis/SKILL.md). A real manifest lists every tracked path in your source repo;
+# this file shows one entry per treatment so the shape is clear.
+#
+# treatment:
+#   copy       - written through unchanged, no personal content to strip
+#   generalize - personal specifics stripped, placeholders swapped in, structure/reasoning kept
+#   example    - rewritten as a sanitized, illustrative version, not the operational original
+#   private    - never exported; still listed so the omission is a decision, not an oversight
+
+entries:
+  - source: LICENSE
+    target: LICENSE
+    treatment: copy
+    note: "No personal content; ships as-is."
+
+  - source: AGENTS.md
+    target: AGENTS.md
+    treatment: generalize
+    note: >
+      Strip the owner's name and GitHub org, and any domain/project names specific to them. Keep
+      the repo layout, merge lanes, and invariants - that's the structure a reader rebuilds from.
+
+  - source: skills/publish-trellis/SKILL.md
+    target: skills/publish-trellis/SKILL.md
+    treatment: example
+    note: >
+      Ship a sanitized illustration of the publishing pattern itself, not the operational copy that
+      points at this box's real repos and state file.
+
+  - source: memory/user_profile.md
+    target: (not exported)
+    treatment: private
+    note: "Personal context about the owner; never leaves this repo."
