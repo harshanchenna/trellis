@@ -1,0 +1,35 @@
+{
+  "autoMemoryDirectory": "~/projects/trellis-knowledge/memory",
+  "autoCompactWindow": 800000,
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
+  },
+  "permissions": {
+    "additionalDirectories": [
+      "~/projects/trellis-knowledge",
+      "~/projects/trellis-cron"
+    ]
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/hooks/pre-compact.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/hooks/session-start.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
