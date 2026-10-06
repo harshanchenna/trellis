@@ -1,0 +1,6 @@
+.env
+.state/
+.claude/settings.local.json
+.DS_Store
+# Session worktrees created by `claude rc --spawn worktree`
+.claude/worktrees/
