@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""bin/cron-health — deterministic liveness check for trellis-cron jobs. Not Claude.
+
+For every job (except itself) whose schedule should have fired in the last 26 hours, checks:
+  - last.json exists
+  - its start time is at or after the latest scheduled slot that should already have fired
+    (the latest occurrence at or before now minus a grace window — not just any occurrence in
+    the window, so a stalled sub-daily job doesn't hide behind an old run)
+  - it exited 0
+  - for a claude job with SUCCESS=exit0: its result wasn't is_error, and had no permission
+    denials (an exit0 with every tool call refused is not a healthy run)
+  - its declared SUCCESS condition holds (exit0, or a trellis-knowledge commit touching a path)
+A job whose lock is currently held (flock -n probe fails) is treated as running, not missed —
+its last.json may still describe the previous run.
+Also checks that the job's systemd --user timer is enabled and active.
+
+On any failure: pings once (bin/ping) with a concise summary and triage steps, and refreshes the
+"## Cron" section of trellis-knowledge/alerts.md (open failures only — resolved ones are
+removed), committing only alerts.md and pushing with kb-push (if configured). Silent when
+everything is green.
+
+Usage: bin/cron-health [--dry-run]
+
+Overridable for testing: STATE_ROOT, KB_DIR, JOBS_DIR env vars.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JOBS_DIR = os.environ.get("JOBS_DIR") or os.path.join(REPO_ROOT, "jobs")
+STATE_ROOT = os.environ.get("STATE_ROOT") or os.path.expanduser("~/.local/state/trellis-cron")
+UNIT_DIR = os.environ.get("UNIT_DIR") or os.path.expanduser("~/.config/systemd/user")
+SELF_NAME = "cron-health"
+KB_DIR = os.environ.get("KB_DIR") or os.path.expanduser("~/projects/trellis-knowledge")
+KB_PUSH = os.environ.get("KB_PUSH") or os.path.join(KB_DIR, "scripts", "kb-push")
+ALERTS_PATH = os.path.join(KB_DIR, "alerts.md")
+# Set this to your own timezone (systemd OnCalendar form, e.g. "America/Los_Angeles" or "UTC").
+TIMEZONE_NAME = os.environ.get("TRELLIS_CRON_TZ") or "UTC"
+WINDOW_HOURS = 26
+GRACE_SECONDS = 300  # allow the timer/run-job start to lag the scheduled time a bit
+# Covers the 26h window down to 5-minute cadence (26*60/5 = 312) with margin. Bump this if a job
+# ever schedules more frequently than every ~4 minutes.
+CALENDAR_ITERATIONS = 400
+
+os.umask(0o077)
+
+
+def parse_job_file(path):
+    """Parse a bash-sourceable KEY=value .job file without executing it."""
+    values = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2)
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            values[key] = val
+    return values
+
+
+def list_jobs():
+    jobs = {}
+    for fname in sorted(os.listdir(JOBS_DIR)):
+        if not fname.endswith(".job"):
+            continue
+        name = fname[:-4]
+        jobs[name] = parse_job_file(os.path.join(JOBS_DIR, fname))
+    return jobs
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def expected_fire_time(schedule, base_dt, now_dt, grace_seconds):
+    """Return ("ok", datetime), ("none", None), or ("error", detail).
+
+    The "ok" datetime is the LATEST scheduled occurrence at or before (now - grace) — not the
+    earliest occurrence in the [base_dt, now] window. Walk forward from base_dt with
+    --iterations and take the max of everything that's already due.
+    """
+    base_str = base_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    expr = f"{schedule} {TIMEZONE_NAME}"
+    proc = run(["systemd-analyze", "calendar", f"--base-time={base_str}",
+                f"--iterations={CALENDAR_ITERATIONS}", expr])
+    if proc.returncode != 0:
+        return "error", (proc.stderr or proc.stdout).strip()
+    matches = re.findall(r"\(in UTC\):\s*\S+\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC", proc.stdout)
+    if not matches:
+        return "error", "could not parse systemd-analyze output: " + proc.stdout.strip()
+    threshold = now_dt - timedelta(seconds=grace_seconds)
+    candidates = [
+        datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for s in matches
+    ]
+    due = [dt for dt in candidates if dt <= threshold]
+    if not due:
+        return "none", None
+    return "ok", max(due)
+
+
+def parse_iso(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def check_success(success_expr, since_dt):
+    if success_expr == "exit0":
+        return True, ""
+    if success_expr.startswith("kb-commit:"):
+        pathspec = success_expr[len("kb-commit:"):]
+        since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        proc = run(["git", "-C", KB_DIR, "log", f"--since={since_str}", "--oneline", "--", pathspec])
+        if proc.returncode != 0:
+            return False, f"git log failed: {proc.stderr.strip()}"
+        if proc.stdout.strip():
+            return True, ""
+        return False, f"no trellis-knowledge commit touching {pathspec} since {since_str}"
+    return False, f"unknown SUCCESS expression: {success_expr}"
+
+
+def timer_status(job_name):
+    unit = f"trellis-cron-{job_name}.timer"
+    enabled = run(["systemctl", "--user", "is-enabled", unit])
+    active = run(["systemctl", "--user", "is-active", unit])
+    return (
+        (enabled.stdout or enabled.stderr).strip() or "unknown",
+        (active.stdout or active.stderr).strip() or "unknown",
+    )
+
+
+def lock_is_held(name):
+    """True if run-job's per-job flock is currently held by a live process."""
+    lock_path = os.path.join(STATE_ROOT, name, ".lock")
+    if not os.path.exists(lock_path):
+        return False
+    proc = run(["flock", "-n", lock_path, "-c", "true"])
+    return proc.returncode != 0
+
+
+def check_job(name, job, now_dt):
+    problems = []
+    schedule = job.get("SCHEDULE")
+    if not schedule:
+        return {
+            "name": name, "expected": None,
+            "problems": [f"jobs/{name}.job has no SCHEDULE"],
+            "timer_enabled": "unknown", "timer_active": "unknown", "running": False,
+        }
+
+    running = lock_is_held(name)
+
+    base_dt = now_dt - timedelta(hours=WINDOW_HOURS)
+    status, val = expected_fire_time(schedule, base_dt, now_dt, GRACE_SECONDS)
+
+    expected_dt = None
+    if status == "error":
+        problems.append(f"could not compute expected schedule: {val}")
+    elif status == "ok":
+        expected_dt = val
+
+    # A slot that fell before the timer was installed was never owed a run (e.g. a weekly job's
+    # last Sunday slot on the day the timers were first enabled). The timer unit's mtime is when
+    # bin/install last wrote it.
+    if expected_dt is not None:
+        unit = os.path.join(UNIT_DIR, f"trellis-cron-{name}.timer")
+        try:
+            installed_dt = datetime.fromtimestamp(os.path.getmtime(unit), tz=timezone.utc)
+        except OSError:
+            installed_dt = None
+        if installed_dt is not None and expected_dt < installed_dt:
+            expected_dt = None
+
+    if expected_dt is not None and running:
+        pass  # a run is in flight for this slot; last.json may still be the previous run
+    elif expected_dt is not None:
+        last_path = os.path.join(STATE_ROOT, name, "last.json")
+        if not os.path.exists(last_path):
+            problems.append(
+                f"expected to fire at {expected_dt.isoformat()} but {last_path} does not exist (job has never run)"
+            )
+        else:
+            try:
+                with open(last_path) as f:
+                    last = json.load(f)
+                start_dt = parse_iso(last["start_utc"])
+                exit_code = int(last["exit"])
+            except Exception as e:  # noqa: BLE001 — surface any parse failure as a finding
+                problems.append(f"could not read/parse {last_path}: {e}")
+                last = None
+                start_dt = None
+                exit_code = None
+
+            if last is not None:
+                if start_dt < expected_dt:
+                    problems.append(
+                        f"last run at {last['start_utc']} predates the expected {expected_dt.isoformat()} run "
+                        "— job appears not to have fired on schedule"
+                    )
+                elif exit_code != 0:
+                    problems.append(f"last run at {last['start_utc']} exited {exit_code} (log: {last.get('log')})")
+                else:
+                    success_expr = job.get("SUCCESS", "exit0")
+                    if success_expr == "exit0":
+                        is_error = last.get("is_error")
+                        denials = last.get("permission_denials")
+                        if is_error:
+                            problems.append(
+                                f"last run at {last['start_utc']} exited 0 but its claude result had "
+                                f"is_error=true (log: {last.get('log')})"
+                            )
+                        if isinstance(denials, int) and denials > 0:
+                            problems.append(
+                                f"last run at {last['start_utc']} had {denials} permission denial(s) "
+                                f"(log: {last.get('log')})"
+                            )
+                    ok, detail = check_success(success_expr, start_dt)
+                    if not ok:
+                        problems.append(f"SUCCESS check failed for run at {last['start_utc']}: {detail}")
+
+    enabled, active = timer_status(name)
+    if enabled not in ("enabled", "enabled-runtime"):
+        problems.append(f"trellis-cron-{name}.timer is not enabled (systemctl --user is-enabled: {enabled})")
+    if active != "active":
+        problems.append(f"trellis-cron-{name}.timer is not active (systemctl --user is-active: {active})")
+
+    return {
+        "name": name,
+        "expected": expected_dt.isoformat() if expected_dt else None,
+        "problems": problems,
+        "timer_enabled": enabled,
+        "timer_active": active,
+        "running": running,
+    }
+
+
+def triage_steps(name):
+    return (
+        f"  - Read the log named in last.json: ~/.local/state/trellis-cron/{name}/last.json (\"log\" field)\n"
+        f"  - Check the unit: systemctl --user status trellis-cron-{name}.service trellis-cron-{name}.timer\n"
+        f"  - Rerun by hand: {REPO_ROOT}/bin/run-job {name}\n"
+        f"  - \"SUCCESS check failed\" means the job exited 0 but its declared proof of work didn't hold "
+        f"(see jobs/{name}.job's SUCCESS line — exit0 or a required trellis-knowledge commit)."
+    )
+
+
+def render_alert_message(failing):
+    lines = [f"cron-health: {len(failing)} job(s) failing"]
+    for f in failing:
+        lines.append("")
+        lines.append(f"**{f['name']}**")
+        for p in f["problems"]:
+            lines.append(f"- {p}")
+        lines.append(triage_steps(f["name"]))
+    return "\n".join(lines)
+
+
+ALERTS_SECTION_RE = re.compile(r"(?ms)^## Cron\n.*?(?=^## |\Z)")
+DEFAULT_ALERTS_CONTENT = "# Alerts\n\nLiving log of open items. Resolved items are deleted; git history is the record.\n"
+
+
+def render_cron_section(failing, now_dt):
+    if not failing:
+        return ""
+    now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = ["## Cron", ""]
+    for f in failing:
+        lines.append(f"- **{f['name']}** (as of {now_str}):")
+        for p in f["problems"]:
+            lines.append(f"  - {p}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def update_alerts_doc(failing, now_dt, dry_run):
+    """Refresh the '## Cron' section of alerts.md. Returns True if a commit was made (or would be)."""
+    if os.path.exists(ALERTS_PATH):
+        with open(ALERTS_PATH) as f:
+            content = f.read()
+        if not content.strip():
+            content = DEFAULT_ALERTS_CONTENT
+    else:
+        content = DEFAULT_ALERTS_CONTENT
+
+    new_section = render_cron_section(failing, now_dt)
+
+    if ALERTS_SECTION_RE.search(content):
+        new_content = ALERTS_SECTION_RE.sub(new_section if new_section else "", content)
+    elif new_section:
+        sep = "\n" if content.endswith("\n") else "\n\n"
+        new_content = content + sep + new_section
+    else:
+        new_content = content
+
+    if new_content == content:
+        return False
+
+    if dry_run:
+        print("would update alerts.md's ## Cron section")
+        return True
+
+    with open(ALERTS_PATH, "w") as f:
+        f.write(new_content)
+
+    subprocess.run(["git", "-C", KB_DIR, "add", "alerts.md"], check=True)
+    diff = subprocess.run(["git", "-C", KB_DIR, "diff", "--cached", "--quiet", "--", "alerts.md"])
+    if diff.returncode == 0:
+        return False  # nothing actually changed after staging (e.g. rerun)
+
+    subprocess.run(["git", "-C", KB_DIR, "commit", "-m", "cron-health: update alerts", "--", "alerts.md"], check=True)
+    if os.path.exists(KB_PUSH):
+        subprocess.run([KB_PUSH], check=True, cwd=KB_DIR)
+    else:
+        subprocess.run(["git", "-C", KB_DIR, "push"], check=True)
+    return True
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv[1:]
+    now_dt = datetime.now(timezone.utc)
+    jobs = list_jobs()
+    jobs.pop(SELF_NAME, None)
+
+    results = [check_job(name, job, now_dt) for name, job in jobs.items()]
+    failing = [r for r in results if r["problems"]]
+
+    if dry_run:
+        print(f"cron-health --dry-run at {now_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        for r in results:
+            status = "FAIL" if r["problems"] else ("running" if r["running"] else "ok")
+            print(
+                f"  {r['name']}: {status} (expected={r['expected']}, "
+                f"timer_enabled={r['timer_enabled']}, timer_active={r['timer_active']})"
+            )
+            for p in r["problems"]:
+                print(f"    - {p}")
+        if failing:
+            print("\nWould ping:\n" + render_alert_message(failing))
+        else:
+            print("\nAll green — would stay silent, no ping.")
+        update_alerts_doc(failing, now_dt, dry_run=True)
+        return 0
+
+    changed = update_alerts_doc(failing, now_dt, dry_run=False)
+
+    if not failing:
+        return 0
+
+    message = render_alert_message(failing)
+    ping_path = os.path.join(REPO_ROOT, "bin", "ping")
+    msg_path = os.path.join(STATE_ROOT, SELF_NAME, ".last-alert-message")
+    os.makedirs(os.path.dirname(msg_path), exist_ok=True)
+    with open(msg_path, "w") as f:
+        f.write(message)
+    subprocess.run([ping_path, "--file", msg_path], check=False)
+    if changed:
+        print("cron-health: updated alerts.md and pinged", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

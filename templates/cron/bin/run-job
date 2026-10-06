@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# bin/run-job NAME — run one job by name.
+#
+# - Takes a per-job flock so a job never overlaps itself.
+# - Logs to ~/.local/state/trellis-cron/NAME/<UTC timestamp>.log.
+# - Writes ~/.local/state/trellis-cron/NAME/last.json atomically (temp file + rename):
+#   {job, start_utc, end_utc, exit, duration_s, log} plus, for claude jobs whose result parsed,
+#   {is_error, permission_denials}.
+# - claude kind: cd ~/projects/trellis, then `claude -p` under `timeout -k 60`, the job's
+#   permission mode (default: auto), --permission-prompts none (so an unlisted tool call is
+#   refused outright instead of hanging on a prompt nobody can answer), and an allowed-tools
+#   list. The allowed-tools list is read from the job's own skill's SKILL.md frontmatter
+#   (~/projects/trellis/skills/<skill>/SKILL.md — the skill name is the job's PROMPT with
+#   the leading "/" and anything from the first space on stripped, e.g. PROMPT="/dream" or
+#   "/some-skill --flag" both name their skill directory) — that's the single source
+#   of truth for what a skill needs. A job may set ALLOWED_TOOLS itself to override this. If
+#   neither the skill file nor an override supplies a list, the run fails (non-zero, recorded in
+#   last.json) rather than falling back to something wrong. `Bash(sudo:*)` is always denied
+#   (--disallowedTools), merged with any job-specific DISALLOWED_TOOLS — deny rules beat allow
+#   rules. Never runs if an API key is set (subscription only).
+# - script kind: runs SCRIPT from the repo root under `bash -o pipefail -c`, same timeout.
+# - Prunes logs older than 30 days.
+set -euo pipefail
+umask 077
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# systemd --user starts jobs with a minimal PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin);
+# claude and other user-local tools often live outside that, so without this every claude-kind job
+# can exit 127. Add whatever your own PATH needs here.
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
+STATE_ROOT="${STATE_ROOT:-$HOME/.local/state/trellis-cron}"
+SKILLS_ROOT="${SKILLS_ROOT:-$HOME/projects/trellis/skills}"
+
+usage() {
+  echo "usage: bin/run-job NAME" >&2
+  exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+NAME="$1"
+# Marks the run as this job's own scheduled run. A skill whose guard looks for its own running
+# unit reads this to tell itself apart from an overlapping run. Only run-job sets it; an
+# interactive session never has it.
+export TRELLIS_CRON_JOB="$NAME"
+JOB_FILE="$REPO_ROOT/jobs/$NAME.job"
+
+if [[ ! -f "$JOB_FILE" ]]; then
+  echo "run-job: no such job: $NAME (expected $JOB_FILE)" >&2
+  exit 2
+fi
+
+# These jobs run on a Claude Code subscription via `claude -p`. If an API key is present in the
+# environment, running would bill the API instead — refuse rather than risk that silently.
+if [[ -n "${ANTHROPIC_API_KEY:-}" || -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+  echo "run-job: ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is set in the environment — refusing to start ($NAME would bill the API instead of the subscription)" >&2
+  exit 3
+fi
+
+# Load the job definition (bash-sourceable KEY=value file, owned by this repo).
+unset SCHEDULE KIND PROJECT TIMEOUT_MIN DESCRIPTION PROMPT ALLOWED_TOOLS DISALLOWED_TOOLS SCRIPT SUCCESS PERMISSION_MODE
+# shellcheck source=/dev/null
+source "$JOB_FILE"
+
+: "${KIND:?$JOB_FILE: KIND not set}"
+: "${TIMEOUT_MIN:?$JOB_FILE: TIMEOUT_MIN not set}"
+PERMISSION_MODE="${PERMISSION_MODE:-auto}"
+
+JOB_STATE_DIR="$STATE_ROOT/$NAME"
+mkdir -p "$JOB_STATE_DIR"
+# Skills write ping messages here with the Write tool; a Bash mkdir from inside the job is
+# refused (a write outside its working directory), so the runner creates it up front.
+mkdir -p "$HOME/.cache/trellis-cron"
+
+LOCK_FILE="$JOB_STATE_DIR/.lock"
+exec 8>"$LOCK_FILE"
+if ! flock -n 8; then
+  echo "run-job: $NAME is already running (lock held on $LOCK_FILE)" >&2
+  exit 4
+fi
+
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+START_EPOCH="$(date -u +%s)"
+LOG_STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
+LOG_FILE="$JOB_STATE_DIR/${LOG_STAMP}.log"
+
+{
+  echo "=== run-job $NAME start $START_TS ==="
+  echo "KIND=$KIND PROJECT=${PROJECT:-} TIMEOUT_MIN=$TIMEOUT_MIN PERMISSION_MODE=$PERMISSION_MODE"
+} >"$LOG_FILE"
+
+set +e
+case "$KIND" in
+  claude)
+    : "${PROMPT:?$JOB_FILE: PROMPT not set}"
+
+    if [[ -z "${ALLOWED_TOOLS:-}" ]]; then
+      SKILL_NAME="${PROMPT#/}"
+      SKILL_NAME="${SKILL_NAME%% *}"
+      SKILL_FILE="$SKILLS_ROOT/$SKILL_NAME/SKILL.md"
+      ALLOWED_TOOLS="$(python3 -c '
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        text = f.read()
+except OSError as e:
+    print(f"cannot read {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+parts = text.split("---", 2)
+if not text.startswith("---") or len(parts) < 3:
+    print(f"{path}: no frontmatter block", file=sys.stderr)
+    sys.exit(1)
+
+value = None
+for line in parts[1].splitlines():
+    if line.startswith("allowed-tools:"):
+        value = line[len("allowed-tools:"):].strip()
+        break
+
+if not value:
+    print(f"{path}: no allowed-tools key in frontmatter", file=sys.stderr)
+    sys.exit(1)
+
+if len(value) >= 2 and value[0] == value[-1] and value[0] in "\x27\"":
+    value = value[1:-1]
+
+print(value)
+' "$SKILL_FILE" 2>>"$LOG_FILE")"
+      RC=$?
+      if [[ $RC -ne 0 || -z "$ALLOWED_TOOLS" ]]; then
+        echo "run-job: could not resolve allowed-tools for skill '$SKILL_NAME' from $SKILL_FILE, and $JOB_FILE sets no ALLOWED_TOOLS override — refusing to run" >>"$LOG_FILE"
+        EXIT=5
+      fi
+    fi
+
+    if [[ "${EXIT:-}" != "5" ]]; then
+      DISALLOWED_TOOLS="Bash(sudo:*)${DISALLOWED_TOOLS:+ $DISALLOWED_TOOLS}"
+      # Headless runs refuse any Bash call whose every part isn't on the allowlist, and a refusal
+      # counts as a failed run. Models like to bundle steps into one compound command (cd; echo;
+      # for-loops), which then gets refused whole.
+      HEADLESS_NOTE="This is an unattended scheduled run with a fixed tool allowlist and nobody to approve anything. When the skill gives a command, run it exactly as written, one per Bash call. When you compose a command yourself, keep it to one plain command (a pipe is fine only when every part of it is on the allowlist): don't add cd, ';' or '&&' chains, shell loops, or an appended echo, because any part outside the allowlist gets the whole call refused. Use Glob and Read to list and read files instead of shell loops. Read exit status from the tool result."
+      (
+        cd "$HOME/projects/trellis" &&
+          timeout -k 60 "${TIMEOUT_MIN}m" claude -p "$PROMPT" \
+            --permission-mode "$PERMISSION_MODE" \
+            --permission-prompts none \
+            --append-system-prompt "$HEADLESS_NOTE" \
+            --allowedTools "$ALLOWED_TOOLS" \
+            --disallowedTools "$DISALLOWED_TOOLS" \
+            --output-format json
+      ) >>"$LOG_FILE" 2>&1
+      EXIT=$?
+    fi
+    ;;
+  script)
+    : "${SCRIPT:?$JOB_FILE: SCRIPT not set}"
+    (
+      cd "$REPO_ROOT" &&
+        timeout -k 60 "${TIMEOUT_MIN}m" bash -o pipefail -c "$SCRIPT"
+    ) >>"$LOG_FILE" 2>&1
+    EXIT=$?
+    ;;
+  *)
+    echo "run-job: unknown KIND '$KIND' in $JOB_FILE" >>"$LOG_FILE"
+    EXIT=2
+    ;;
+esac
+set -e
+
+END_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+END_EPOCH="$(date -u +%s)"
+DURATION=$((END_EPOCH - START_EPOCH))
+
+echo "=== run-job $NAME end $END_TS exit=$EXIT duration=${DURATION}s ===" >>"$LOG_FILE"
+
+LAST_JSON="$JOB_STATE_DIR/last.json"
+python3 - "$LAST_JSON" "$NAME" "$START_TS" "$END_TS" "$EXIT" "$DURATION" "$LOG_FILE" "$KIND" <<'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+out_path, job, start, end, exit_code, duration, log, kind = sys.argv[1:9]
+data = {
+    "job": job,
+    "start_utc": start,
+    "end_utc": end,
+    "exit": int(exit_code),
+    "duration_s": int(duration),
+    "log": log,
+}
+
+if kind == "claude":
+    # The claude invocation's --output-format json result is the last JSON object on stdout
+    # (the log also has our own bash echo lines around it). Tolerate any failure to find/parse
+    # it — is_error/permission_denials just won't be in last.json for this run.
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        lines = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "is_error" in obj:
+            denials = obj.get("permission_denials")
+            data["is_error"] = bool(obj.get("is_error"))
+            data["permission_denials"] = len(denials) if isinstance(denials, list) else 0
+            break
+
+out_dir = os.path.dirname(out_path) or "."
+fd, tmp_path = tempfile.mkstemp(prefix=".last.json.", dir=out_dir)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, out_path)
+except BaseException:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+PYEOF
+
+# Prune logs older than 30 days (last.json and the lock file are untouched).
+find "$JOB_STATE_DIR" -maxdepth 1 -name '*.log' -mtime +30 -delete
+
+exit "$EXIT"

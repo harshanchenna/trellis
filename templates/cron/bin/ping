@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# bin/ping ("message" | --file PATH | -) [--record SECTION] — send an alert to the user as a Discord DM.
+#
+# Message source (pick exactly one):
+#   "message"    a trusted literal, for scripts that build their own short status line. Not for
+#                text derived from anything external (email, web, API payloads) — that goes
+#                through --file or stdin so it never reaches a shell command line.
+#   --file PATH  read the message from PATH.
+#   -            read the message from stdin.
+#
+# The message is sanitized before it's sent: @everyone, @here, and <@id>/<@!id>/<@&id>/<#id>
+# mention sequences are stripped, and the JSON payload also sets allowed_mentions:{parse:[]} as
+# a second layer. Truncated to 1990 chars (codepoint-safe) to stay under Discord's 2000-char
+# limit. The DM goes through your Discord bot (the one the user chats with the agent through):
+# open a DM channel with DISCORD_ALERT_USER_ID, then post to it. The bot token is read and used
+# inside python, never on argv, so it never shows in `ps`; the payload goes through a temp file
+# (umask 077), not argv either.
+#
+# --record SECTION: after sending (sent or failed), append a dated line — the sanitized
+# message's first line, truncated to 150 chars — under "## SECTION" in
+# ~/projects/trellis-knowledge/alerts.md (creating the file/header/section if missing), then
+# commit *only* alerts.md (never sweeps in another session's staged changes) and push with
+# kb-push if present, else a plain git push. The exit code always reflects whether the *send*
+# succeeded, regardless of --record.
+#
+# Reads DISCORD_BOT_TOKEN and DISCORD_ALERT_USER_ID from ~/projects/trellis/.env at the
+# point of use (parsed, never sourced, never echoed). Every ping — sent or not — is logged
+# locally (first line only).
+#
+# Overridable for testing: ENV_FILE, KB_DIR, KB_PUSH, STATE_ROOT.
+set -euo pipefail
+umask 077
+
+usage() {
+  echo "usage: bin/ping (\"message\" | --file PATH | -) [--record SECTION]" >&2
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+
+MESSAGE_SOURCE=""
+MESSAGE_ARG=""
+
+case "$1" in
+  --file)
+    [[ $# -ge 2 ]] || usage
+    MESSAGE_SOURCE="file"
+    MESSAGE_ARG="$2"
+    shift 2
+    ;;
+  -)
+    MESSAGE_SOURCE="stdin"
+    shift
+    ;;
+  --record)
+    usage
+    ;;
+  *)
+    MESSAGE_SOURCE="arg"
+    MESSAGE_ARG="$1"
+    shift
+    ;;
+esac
+
+RECORD_SECTION=""
+if [[ "${1:-}" == "--record" ]]; then
+  [[ $# -ge 2 ]] || usage
+  RECORD_SECTION="$2"
+  shift 2
+fi
+
+[[ $# -eq 0 ]] || usage
+
+case "$MESSAGE_SOURCE" in
+  file)
+    [[ -f "$MESSAGE_ARG" ]] || { echo "bin/ping: no such file: $MESSAGE_ARG" >&2; exit 2; }
+    MESSAGE="$(cat "$MESSAGE_ARG")"
+    ;;
+  stdin)
+    MESSAGE="$(cat)"
+    ;;
+  arg)
+    MESSAGE="$MESSAGE_ARG"
+    ;;
+esac
+
+ENV_FILE="${ENV_FILE:-$HOME/projects/trellis/.env}"
+KB_DIR="${KB_DIR:-$HOME/projects/trellis-knowledge}"
+KB_PUSH="${KB_PUSH:-$KB_DIR/scripts/kb-push}"
+ALERTS_PATH="$KB_DIR/alerts.md"
+STATE_DIR="${STATE_ROOT:-$HOME/.local/state/trellis-cron}/ping"
+LOG_FILE="$STATE_DIR/ping.log"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+mkdir -p "$STATE_DIR"
+
+log() {
+  printf '%s %s\n' "$TS" "$1" >>"$LOG_FILE"
+}
+
+PAYLOAD_FILE="$(mktemp)"
+RECORD_FILE="$(mktemp)"
+cleanup() { rm -f "$PAYLOAD_FILE" "$RECORD_FILE"; }
+trap cleanup EXIT
+
+# Sanitize once; reuse for both the Discord payload and the alerts.md record line so they never
+# disagree about what was stripped.
+python3 -c '
+import json
+import re
+import sys
+
+payload_out, record_out = sys.argv[1], sys.argv[2]
+message = sys.stdin.read()
+
+message = re.sub(r"@everyone", "", message)
+message = re.sub(r"@here", "", message)
+message = re.sub(r"<@[!&]?\d+>", "", message)
+message = re.sub(r"<#\d+>", "", message)
+
+content = message
+limit = 1990
+if len(content) > limit:
+    content = content[:limit] + "\n… (truncated)"
+
+payload = {"content": content, "allowed_mentions": {"parse": []}}
+with open(payload_out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(payload))
+
+lines = message.splitlines()
+first_line = lines[0] if lines else ""
+with open(record_out, "w", encoding="utf-8") as f:
+    f.write(first_line[:150])
+' "$PAYLOAD_FILE" "$RECORD_FILE" <<<"$MESSAGE"
+
+# Codepoint-safe (computed in python above), and sanitized like everything else this script logs.
+LOG_LINE="$(cat "$RECORD_FILE")"
+
+SEND_STATUS=1
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "bin/ping: $ENV_FILE not found — cannot send alert" >&2
+  log "SKIPPED (no .env): $LOG_LINE"
+  SEND_STATUS=2
+else
+  # The bot token and user ID are read inside python from the .env file, so neither ever
+  # appears in argv or the environment of a child process.
+  set +e
+  RESULT="$(python3 - "$ENV_FILE" "$PAYLOAD_FILE" <<'PYEOF'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+env_path, payload_path = sys.argv[1], sys.argv[2]
+# Capture only the two keys needed; every other line of the shared .env is skipped unread.
+WANTED = ("DISCORD_BOT_TOKEN", "DISCORD_ALERT_USER_ID")
+found = {}
+with open(env_path) as f:
+    for raw in f:
+        k, sep, v = raw.partition("=")
+        k = k.strip()
+        if sep and k in WANTED and k not in found:
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            found[k] = v
+
+token = found.get("DISCORD_BOT_TOKEN", "")
+user_id = found.get("DISCORD_ALERT_USER_ID", "")
+if not token or not user_id.isdigit():
+    print("not-configured")
+    sys.exit(2)
+
+API = "https://discord.com/api/v10"
+HEADERS = {
+    "Authorization": f"Bot {token}",
+    "Content-Type": "application/json",
+    "User-Agent": "DiscordBot (https://github.com/<your-github-user>/trellis-cron, 1.0)",
+}
+
+def post(path, body):
+    req = urllib.request.Request(API + path, data=json.dumps(body).encode(), headers=HEADERS, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+    except (urllib.error.URLError, OSError, ValueError):
+        # Network failure, timeout, or an unparseable response body. Anything else is a bug
+        # and is left to surface (without the token: it only lives in HEADERS).
+        return 0, {}
+
+status, dm = post("/users/@me/channels", {"recipient_id": user_id})
+if status != 200 or "id" not in dm:
+    print(f"dm-open-{status}")
+    sys.exit(1)
+
+with open(payload_path, encoding="utf-8") as f:
+    payload = json.load(f)
+status, _ = post(f"/channels/{dm['id']}/messages", payload)
+if status in (200, 201):
+    print(f"sent-{status}")
+    sys.exit(0)
+print(f"send-{status}")
+sys.exit(1)
+PYEOF
+)"
+  SEND_STATUS=$?
+  set -e
+
+  case "$SEND_STATUS" in
+    0) log "SENT ($RESULT): $LOG_LINE" ;;
+    2)
+      echo "bin/ping: DISCORD_BOT_TOKEN / DISCORD_ALERT_USER_ID not set in $ENV_FILE — cannot send alert" >&2
+      log "SKIPPED (not configured): $LOG_LINE"
+      ;;
+    *)
+      echo "bin/ping: Discord DM failed ($RESULT)" >&2
+      log "FAILED ($RESULT): $LOG_LINE"
+      SEND_STATUS=1
+      ;;
+  esac
+fi
+
+if [[ -n "$RECORD_SECTION" ]]; then
+  RECORD_LINE="$(cat "$RECORD_FILE")"
+  if [[ "$SEND_STATUS" -ne 0 ]]; then
+    RECORD_LINE="${RECORD_LINE} (ping failed)"
+  fi
+  DATE_ONLY="$(date -u +%Y-%m-%d)"
+
+  mkdir -p "$KB_DIR"
+  python3 - "$ALERTS_PATH" "$RECORD_SECTION" "$DATE_ONLY" "$RECORD_LINE" <<'PYEOF'
+import sys
+
+alerts_path, section, date_only, line = sys.argv[1:5]
+
+try:
+    with open(alerts_path) as f:
+        content = f.read()
+except FileNotFoundError:
+    content = ""
+
+if not content.strip():
+    content = "# Alerts\n\nLiving log of open items. Resolved items are deleted; git history is the record.\n"
+
+entry = f"- {date_only} {line}"
+heading = f"## {section}"
+
+lines = content.splitlines()
+if heading in lines:
+    idx = lines.index(heading)
+    insert_at = idx + 1
+    while insert_at < len(lines) and not lines[insert_at].startswith("## "):
+        insert_at += 1
+    lines.insert(insert_at, entry)
+else:
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    lines.append(heading)
+    lines.append("")
+    lines.append(entry)
+
+new_content = "\n".join(lines) + "\n"
+with open(alerts_path, "w") as f:
+    f.write(new_content)
+PYEOF
+
+  GIT_DIR="$(git -C "$KB_DIR" rev-parse --git-dir 2>/dev/null || echo "$KB_DIR/.git")"
+  COMMIT_MSG="alerts: $RECORD_SECTION entry"
+
+  # `add` (not `-A`) then a pathspec-limited commit: only alerts.md is ever staged by this
+  # script, and the commit only ever takes alerts.md, so another session's staged work is never
+  # swept in either way.
+  commit_alerts() {
+    git -C "$KB_DIR" add alerts.md && git -C "$KB_DIR" commit -m "$COMMIT_MSG" -- alerts.md
+  }
+
+  if [[ -f "$GIT_DIR/index.lock" ]]; then
+    sleep 3
+  fi
+  if ! commit_alerts >/dev/null 2>&1; then
+    if [[ -f "$GIT_DIR/index.lock" ]]; then
+      sleep 3
+      commit_alerts >/dev/null 2>&1 || echo "bin/ping: alerts.md commit failed" >&2
+    else
+      echo "bin/ping: alerts.md commit failed (or nothing to commit)" >&2
+    fi
+  fi
+
+  if [[ -x "$KB_PUSH" ]]; then
+    "$KB_PUSH" || echo "bin/ping: kb-push failed" >&2
+  else
+    git -C "$KB_DIR" push || echo "bin/ping: git push failed" >&2
+  fi
+fi
+
+exit "$SEND_STATUS"

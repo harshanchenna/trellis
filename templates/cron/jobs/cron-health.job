@@ -1,0 +1,8 @@
+# jobs/cron-health.job
+DESCRIPTION="Deterministic liveness check for every job: pings on failure with triage steps, silent when everything is green."
+SCHEDULE="*-*-* 07:00:00"
+KIND="script"
+PROJECT="self-improve"
+TIMEOUT_MIN=5
+SCRIPT="bin/cron-health"
+SUCCESS="exit0"

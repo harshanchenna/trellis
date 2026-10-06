@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# bin/install [--enable|--uninstall] — generate systemd --user units for every job in jobs/.
+#
+# Default: writes ~/.config/systemd/user/trellis-cron-NAME.{service,timer} for every job and runs
+# `systemctl --user daemon-reload`. Does not enable or start anything.
+# --enable: also enables and starts every timer.
+# --uninstall: disables/stops and removes all trellis-cron units.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNIT_DIR="$HOME/.config/systemd/user"
+# Set this to your own timezone (IANA name, e.g. "America/Los_Angeles" or "UTC").
+TIMEZONE_NAME="${TRELLIS_CRON_TZ:-UTC}"
+
+ENABLE=0
+UNINSTALL=0
+for arg in "$@"; do
+  case "$arg" in
+    --enable) ENABLE=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    *)
+      echo "install: unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "$UNIT_DIR"
+
+JOB_NAMES=()
+for job_file in "$REPO_ROOT"/jobs/*.job; do
+  [[ -e "$job_file" ]] || continue
+  JOB_NAMES+=("$(basename "$job_file" .job)")
+done
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+  for name in "${JOB_NAMES[@]}"; do
+    unit="trellis-cron-$name"
+    echo "install: stopping/disabling $unit.timer"
+    systemctl --user disable --now "$unit.timer" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$unit.service" "$UNIT_DIR/$unit.timer"
+  done
+  systemctl --user daemon-reload
+  echo "install: uninstalled ${#JOB_NAMES[@]} job unit(s)"
+  exit 0
+fi
+
+for name in "${JOB_NAMES[@]}"; do
+  job_file="$REPO_ROOT/jobs/$name.job"
+  unset SCHEDULE KIND PROJECT TIMEOUT_MIN DESCRIPTION PROMPT ALLOWED_TOOLS DISALLOWED_TOOLS SCRIPT SUCCESS PERMISSION_MODE
+  # shellcheck source=/dev/null
+  source "$job_file"
+
+  : "${SCHEDULE:?$job_file: SCHEDULE not set}"
+  : "${DESCRIPTION:?$job_file: DESCRIPTION not set}"
+
+  unit="trellis-cron-$name"
+
+  # systemd unit files treat a bare "%" as the start of a specifier (e.g. %h, %i); escape it as
+  # "%%" in every free-text field we write, so a schedule or description containing a literal
+  # "%" doesn't get misinterpreted or fail to parse.
+  DESCRIPTION_ESCAPED="${DESCRIPTION//%/%%}"
+  SCHEDULE_ESCAPED="${SCHEDULE//%/%%}"
+
+  cat >"$UNIT_DIR/$unit.service" <<EOF
+[Unit]
+Description=$DESCRIPTION_ESCAPED (trellis-cron: $name)
+
+[Service]
+Type=oneshot
+Environment=LANG=C.UTF-8
+ExecStart=$REPO_ROOT/bin/run-job $name
+EOF
+
+  cat >"$UNIT_DIR/$unit.timer" <<EOF
+[Unit]
+Description=$DESCRIPTION_ESCAPED (trellis-cron: $name, timer)
+
+[Timer]
+OnCalendar=$SCHEDULE_ESCAPED $TIMEZONE_NAME
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  echo "install: wrote $UNIT_DIR/$unit.service and $unit.timer"
+done
+
+systemctl --user daemon-reload
+echo "install: daemon-reload complete for ${#JOB_NAMES[@]} job(s)"
+
+if [[ "$ENABLE" -eq 1 ]]; then
+  FAILED_UNITS=()
+  for name in "${JOB_NAMES[@]}"; do
+    unit="trellis-cron-$name"
+    if systemctl --user enable --now "$unit.timer"; then
+      echo "install: enabled and started $unit.timer"
+    else
+      echo "install: FAILED to enable/start $unit.timer" >&2
+      FAILED_UNITS+=("$unit.timer")
+    fi
+  done
+
+  echo ""
+  echo "install: --enable summary: ${#JOB_NAMES[@]} unit(s), ${#FAILED_UNITS[@]} failed"
+  if [[ "${#FAILED_UNITS[@]}" -gt 0 ]]; then
+    echo "install: failed units:" >&2
+    for u in "${FAILED_UNITS[@]}"; do
+      echo "  - $u" >&2
+    done
+    exit 1
+  fi
+else
+  echo "install: units written only (pass --enable to enable and start the timers)"
+fi

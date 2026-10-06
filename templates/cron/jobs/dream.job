@@ -1,0 +1,11 @@
+# jobs/dream.job
+# ALLOWED_TOOLS is not set here — run-job reads it from ~/projects/trellis/skills/dream/
+# SKILL.md's own frontmatter (single source of truth; see AGENTS.md). Until that skill lands,
+# runs of this job fail closed rather than falling back to a stale copied list.
+DESCRIPTION="Nightly dream: consolidates memory and project docs from the day, prunes stale items, updates the week's dream doc, and messages running sessions about overnight changes."
+SCHEDULE="*-*-* 06:00:00"
+KIND="claude"
+PROJECT="self-improve"
+TIMEOUT_MIN=20
+PROMPT="/dream"
+SUCCESS="exit0"
