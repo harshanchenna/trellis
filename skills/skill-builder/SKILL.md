@@ -55,6 +55,7 @@ Follow the `/pr` flow: a branch in a worktree under `~/projects/.worktrees/`, ne
   - `allowed-tools` is the narrowest list that works. A skill meant for a scheduled job gets per-command `Bash(...)` entries, not bare `Bash`.
   - `SKILL.md` stays under ~300 lines; push detail into reference files loaded on demand.
   - Match the voice and structure of the existing skills.
+  - A skill meant for scheduled runs doesn't list `Agent` in its `allowed-tools`; `/cron-builder` treats that as a hard stop. A pre-existing skill may carry a documented exception, but its dispatch prompts then have to repeat the runner's one-plain-command rule themselves, since the runner's note doesn't reach the subagents it spawns.
 - **For drafting help:** `anthropic-skills:skill-creator` has good guidance on structure and descriptions. Use its drafting advice; its full eval and benchmark loop is more than this needs.
 - **The skill applies the agent's rules, never restates or loosens them:** invariants, merge lanes, `/update-state`, and the knowledge-base push rules.
 

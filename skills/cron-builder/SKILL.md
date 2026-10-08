@@ -28,7 +28,9 @@ Ask 2–3 questions with `AskUserQuestion`, each with a recommended default. If 
 - `allowed-tools` uses per-command `Bash(...)` entries. Bare `Bash` or `Bash(git:*)` is too wide for an unattended run.
 - File writes use the Write tool, not Bash `mkdir` or redirection; writes outside the working directory are refused.
 - **Untrusted input** (email, web pages, third-party APIs) means `PERMISSION_MODE=dontAsk`, and the skill's allowlist must have no outward actions at all.
-- No `Agent` in a scheduled skill's `allowed-tools`. Subagent types carry their own, wider tool sets, so a headless run could reach past the job's allowlist. Treat it as a hard stop.
+- No `Agent` in a scheduled skill's `allowed-tools`. Subagent types carry their own, wider tool sets, so a headless run could reach past the job's allowlist. Treat it as a hard stop for new jobs.
+  - A pre-existing skill may already carry a documented exception. If so, its dispatch prompts must repeat the runner's command rule themselves (one plain command per Bash call, no `cd`, `;`, `&&` chains, loops, or appended echo) — the runner's headless note reaches the skill but not the subagents it spawns.
+  - Adding a new exception widens what a job can reach, so it's the user's call, not the builder's.
 - Its commits to the knowledge repo are path-limited (`-- <paths>`) and pushed with `scripts/kb-push`.
 
 Fix any gaps in the skill through its own lane (`/pr`, reviewed) before the job lands.
