@@ -2,7 +2,7 @@
 name: dream
 description: "Nightly consolidation: reconciles the last 24 hours into memory and project docs, audits a rotating slice of older memory for stale or contradictory facts, prunes stale weekly rollups, surfaces what only the user can resolve, and briefs running sessions on what changed. Meant to run nightly as a scheduled job, after any other early-morning jobs. Use when the user says 'dream' or /dream."
 argument-hint: "[--dry-run]"
-allowed-tools: Read, Write, Edit, Glob, Grep, ListAgents, SendMessage, Bash(git -C ~/projects/trellis-knowledge:*), Bash(date:*), Bash(python3 ~/projects/trellis-knowledge/scripts/build-manifest.py), Bash(~/projects/trellis-knowledge/scripts/kb-push), Bash(~/projects/trellis-cron/bin/ping --file:*), Bash(find ~/projects/trellis/.state/handoff/ -mtime -1 -type f:*)
+allowed-tools: Read, Write, Edit, Glob, Grep, ListAgents, SendMessage, Bash(git -C ~/projects/trellis-knowledge pull --rebase --autostash), Bash(git -C ~/projects/trellis-knowledge rebase --abort), Bash(git -C ~/projects/trellis-knowledge add:*), Bash(git -C ~/projects/trellis-knowledge commit -m:*), Bash(git -C ~/projects/trellis-knowledge log:*), Bash(git -C ~/projects/trellis-knowledge rm -q docs/self-improve/dream/:*), Bash(date:*), Bash(python3 ~/projects/trellis-knowledge/scripts/build-manifest.py), Bash(~/projects/trellis-knowledge/scripts/kb-push), Bash(~/projects/trellis-cron/bin/ping --file:*), Bash(find ~/projects/trellis/.state/handoff/ -mtime -1 -type f:*)
 ---
 
 # /dream
@@ -23,7 +23,7 @@ If this conflicts, stop — don't attempt to resolve it. Run `git -C ~/projects/
 2. Commit and push just that:
    ```bash
    git -C ~/projects/trellis-knowledge add alerts.md
-   git -C ~/projects/trellis-knowledge commit -m "dream: rebase conflict, needs the user"   # no attribution trailers
+   git -C ~/projects/trellis-knowledge commit -m "dream: rebase conflict, needs the user" -- alerts.md   # no attribution trailers
    ~/projects/trellis-knowledge/scripts/kb-push
    ```
 3. Ping — never put the message on the command line (it can carry attacker-influenced text pulled in during a later run's gathering, and gets shell-expanded); write it to a file instead:
@@ -158,11 +158,11 @@ This is the last step, after the weekly doc, the session messages, and the ping 
 ```bash
 python3 ~/projects/trellis-knowledge/scripts/build-manifest.py
 git -C ~/projects/trellis-knowledge add memory/MEMORY.md docs/manifest.json alerts.md docs/self-improve/dream/audit-cursor.json <every other path this run actually changed>
-git -C ~/projects/trellis-knowledge commit -m "dream: <one-line summary of what changed>"   # no attribution trailers
+git -C ~/projects/trellis-knowledge commit -m "dream: <one-line summary of what changed>" -- memory/MEMORY.md docs/manifest.json alerts.md docs/self-improve/dream/audit-cursor.json docs/self-improve/dream/ <every other path this run actually changed>   # no attribution trailers
 ~/projects/trellis-knowledge/scripts/kb-push
 ```
 
-Stage only the paths this run touched — never `git add -A`; other sessions write to this repo at the same time and an untouched path in `git status` is someone else's work in progress. If `kb-push` fails, stop and show its message rather than retrying (see `memory/reference_kb_encryption.md`).
+Stage only the paths this run touched — never `git add -A`; other sessions write to this repo at the same time and an untouched path in `git status` is someone else's work in progress. Commit with an explicit pathspec (`-- <paths>`) too, same reason: a plain `git commit` after `git add` would also sweep in anything another session staged in this repo in the meantime. The rollup directory is in the pathspec so step 4's `git rm` prunes (already staged by `rm` itself) land in this commit. The allowlist matches only command prefixes, so it can't enforce any of this; the text has to. Every commit ends with its `-- <paths>`. Never pass `--amend`. Never put `..` in a path you `git rm`. If `kb-push` fails, stop and show its message rather than retrying (see `memory/reference_kb_encryption.md`).
 
 ## Error handling
 
