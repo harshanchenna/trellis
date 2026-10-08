@@ -73,6 +73,7 @@ The agent exists only when launched from this repo. Nothing is installed into gl
 | `cron-builder` | Turn an existing skill or script into a scheduled job: cadence, latitude, the job file, and a proven systemd run. |
 | `self-improve` | Review how the agent has been performing and propose one concrete improvement to its own config as a PR. |
 | `dream` | Nightly consolidation: reconcile the last day into memory and project docs, audit older memory, prune stale rollups. |
+| `huddle` | Gather every running session's state, reconcile collisions, write one chores list, and hand each session its part back. Runs weekly as a read-only report. |
 | `publish-trellis` | Export a generalized, secret-scanned snapshot of your private agent into a public template repo like this one, gated by an allowlist and a denylist scan, for your own review before you ever push it. |
 
 ## Templates for the other two repos
