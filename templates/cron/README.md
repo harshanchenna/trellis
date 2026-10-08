@@ -9,7 +9,7 @@ jobs in the same slot run in parallel as separate sessions.
 | Time | Job | Kind | Project | Pings when |
 |---|---|---|---|---|
 | 06:00 daily | `dream` | Claude | self-improve | a decision is truly the user's to make |
-| 07:00 daily | `cron-health` | plain script, no Claude | self-improve | any job didn't run, failed, or (for a claude job) had a permission denial, with triage steps |
+| 07:00 daily | `cron-health` | plain script, no Claude | self-improve | any job didn't run, failed its SUCCESS check, or (for a claude job) had `is_error` or a permission denial, or has no SUCCESS line; with triage steps |
 
 These two are the shipped starting point. Add your own jobs the same way (see "Add a job" below)
 and extend this table.
@@ -36,9 +36,12 @@ allowlist.
 
 `cron-health` checks every job's schedule for the latest slot that should already have fired (as
 of now, minus a grace window) against the last 26 hours: did that slot's run happen, exit 0, and
-satisfy its `SUCCESS` condition — and for a claude job, did it come back clean (no `is_error`, no
-permission denials) — and is its timer enabled and active. A job whose lock is currently held is
-treated as running, not missed. It's silent when everything's green.
+satisfy its `SUCCESS` condition — and, whenever `last.json` recorded a claude result, did it come
+back clean (no `is_error`, no permission denials), checked regardless of whether `SUCCESS` is
+`exit0` or a `kb-commit` — and is its timer enabled and active. A claude-kind job with no
+`SUCCESS` line at all is flagged on its own, so a new skill job can't silently default to exit0.
+A job whose lock is currently held is treated as running, not missed. It's silent when
+everything's green.
 
 ## Rerun a job by hand
 

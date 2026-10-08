@@ -292,7 +292,10 @@ PYEOF
   if [[ -x "$KB_PUSH" ]]; then
     "$KB_PUSH" || echo "bin/ping: kb-push failed" >&2
   else
-    git -C "$KB_DIR" push || echo "bin/ping: git push failed" >&2
+    # No force, no "matching"/push.default surprises: push exactly the current branch (HEAD)
+    # to its already-configured upstream. If there is no upstream, this fails loudly instead of
+    # inventing one.
+    git -C "$KB_DIR" push HEAD || echo "bin/ping: git push failed" >&2
   fi
 fi
 

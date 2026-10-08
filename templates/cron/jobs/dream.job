@@ -2,10 +2,14 @@
 # ALLOWED_TOOLS is not set here — run-job reads it from ~/projects/trellis/skills/dream/
 # SKILL.md's own frontmatter (single source of truth; see AGENTS.md). Until that skill lands,
 # runs of this job fail closed rather than falling back to a stale copied list.
+# SUCCESS is kb-commit, not exit0: the skill's last step always appends to the week's dream doc
+# and commits it, even on an all-quiet night ("Nothing to consolidate." still gets a line) — only
+# its sync step's rebase-conflict path skips it, and that path already ends the run non-zero on
+# its own. exit0 alone would hide a run that exited 0 without actually doing the work.
 DESCRIPTION="Nightly dream: consolidates memory and project docs from the day, prunes stale items, updates the week's dream doc, and messages running sessions about overnight changes."
 SCHEDULE="*-*-* 06:00:00"
 KIND="claude"
 PROJECT="self-improve"
 TIMEOUT_MIN=20
 PROMPT="/dream"
-SUCCESS="exit0"
+SUCCESS="kb-commit:docs/self-improve/dream/*.md"

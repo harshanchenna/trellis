@@ -7,8 +7,11 @@ For every job (except itself) whose schedule should have fired in the last 26 ho
     (the latest occurrence at or before now minus a grace window — not just any occurrence in
     the window, so a stalled sub-daily job doesn't hide behind an old run)
   - it exited 0
-  - for a claude job with SUCCESS=exit0: its result wasn't is_error, and had no permission
-    denials (an exit0 with every tool call refused is not a healthy run)
+  - when last.json recorded a claude result (any claude-kind job, regardless of its SUCCESS
+    expression): it wasn't is_error, and had no permission denials (an exit0 with every tool
+    call refused, or one that silently halted without is_error, is not a healthy run on its own)
+  - a claude-kind job declares a SUCCESS line at all — one defaulting to exit0 is flagged, so a
+    new skill job can't silently skip picking a real criterion
   - its declared SUCCESS condition holds (exit0, or a trellis-knowledge commit touching a path)
 A job whose lock is currently held (flock -n probe fails) is treated as running, not missed —
 its last.json may still describe the previous run.
@@ -111,13 +114,20 @@ def parse_iso(s):
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
-def check_success(success_expr, since_dt):
+def check_success(success_expr, since_dt, timeout_min=None):
     if success_expr == "exit0":
         return True, ""
     if success_expr.startswith("kb-commit:"):
         pathspec = success_expr[len("kb-commit:"):]
         since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        proc = run(["git", "-C", KB_DIR, "log", f"--since={since_str}", "--oneline", "--", pathspec])
+        args = ["git", "-C", KB_DIR, "log", f"--since={since_str}"]
+        if timeout_min:
+            # Bound the window to this run: its timeout, timeout's 60s kill grace, and 5 min of
+            # slack. Without it, a later commit to the same path (another session, an interactive
+            # run) would count as this run's artifact.
+            until_dt = since_dt + timedelta(minutes=int(timeout_min) + 6)
+            args.append(f"--until={until_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        proc = run(args + ["--oneline", "--", pathspec])
         if proc.returncode != 0:
             return False, f"git log failed: {proc.stderr.strip()}"
         if proc.stdout.strip():
@@ -207,21 +217,36 @@ def check_job(name, job, now_dt):
                 elif exit_code != 0:
                     problems.append(f"last run at {last['start_utc']} exited {exit_code} (log: {last.get('log')})")
                 else:
-                    success_expr = job.get("SUCCESS", "exit0")
-                    if success_expr == "exit0":
-                        is_error = last.get("is_error")
-                        denials = last.get("permission_denials")
-                        if is_error:
+                    success_expr = job.get("SUCCESS")
+                    if not success_expr:
+                        if job.get("KIND") == "claude":
                             problems.append(
-                                f"last run at {last['start_utc']} exited 0 but its claude result had "
-                                f"is_error=true (log: {last.get('log')})"
+                                f"jobs/{name}.job has no SUCCESS line — a claude/skill job must "
+                                "declare one explicitly (exit0, with a reason it's the strongest "
+                                "available signal, or kb-commit:<pathspec>) rather than silently "
+                                "default to exit0"
                             )
-                        if isinstance(denials, int) and denials > 0:
-                            problems.append(
-                                f"last run at {last['start_utc']} had {denials} permission denial(s) "
-                                f"(log: {last.get('log')})"
-                            )
-                    ok, detail = check_success(success_expr, start_dt)
+                        success_expr = "exit0"
+
+                    # Checked regardless of which SUCCESS expression the job declares: last.json
+                    # only carries is_error/permission_denials when run-job's claude invocation
+                    # produced a parseable result, so this is a no-op for script-kind jobs. A
+                    # kb-commit job that nonetheless came back is_error, or with every call
+                    # refused, is not healthy even if its artifact happens to be present.
+                    is_error = last.get("is_error")
+                    denials = last.get("permission_denials")
+                    if is_error:
+                        problems.append(
+                            f"last run at {last['start_utc']} exited 0 but its claude result had "
+                            f"is_error=true (log: {last.get('log')})"
+                        )
+                    if isinstance(denials, int) and denials > 0:
+                        problems.append(
+                            f"last run at {last['start_utc']} had {denials} permission denial(s) "
+                            f"(log: {last.get('log')})"
+                        )
+
+                    ok, detail = check_success(success_expr, start_dt, job.get("TIMEOUT_MIN"))
                     if not ok:
                         problems.append(f"SUCCESS check failed for run at {last['start_utc']}: {detail}")
 
@@ -318,7 +343,10 @@ def update_alerts_doc(failing, now_dt, dry_run):
     if os.path.exists(KB_PUSH):
         subprocess.run([KB_PUSH], check=True, cwd=KB_DIR)
     else:
-        subprocess.run(["git", "-C", KB_DIR, "push"], check=True)
+        # No force, no push.default surprises: push exactly the current branch (HEAD) to its
+        # already-configured upstream. check=True means a failure (including "no upstream")
+        # raises and exits non-zero instead of failing silently.
+        subprocess.run(["git", "-C", KB_DIR, "push", "HEAD"], check=True)
     return True
 
 

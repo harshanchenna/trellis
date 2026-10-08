@@ -27,6 +27,21 @@ timezone suffix — `bin/install` and `bin/cron-health` both append your configu
 `KIND` (`claude` or `script`), `PROJECT`, `TIMEOUT_MIN`, `DESCRIPTION`, `SUCCESS` (`exit0`, or
 `kb-commit:<pathspec>` — a trellis-knowledge commit touching that path since the run started).
 
+**A `claude`-kind job runs a skill, and a skill job's `SUCCESS` must prove the skill actually did
+its work, not just that the process exited 0.** Exit 0 alone is too weak a signal for a skill that
+can quietly no-op (an overlap guard that exits early, a gate that halts before doing anything).
+Prefer `kb-commit:<pathspec>` naming the artifact the skill's own `SKILL.md` says it writes every
+run (check whether the skill commits unconditionally, including on a quiet day — `dream` always
+appends to the week's doc, even "Nothing to consolidate."). Fall back to `exit0` only when a
+normal, successful run can legitimately leave no artifact — pick that deliberately, not by
+omission, and say why in a comment next to the `SUCCESS` line. `script`-kind jobs (not running a
+skill) can stay `exit0`; they have no skill-declared artifact to check against.
+`bin/cron-health` flags a `claude`-kind job that has no `SUCCESS` line at all, so a new skill job
+can't silently default to exit0 by omission. Regardless of which `SUCCESS` expression a job
+declares, `bin/cron-health` also checks `last.json`'s `is_error`/`permission_denials` whenever a
+claude result was recorded — an exit-0 run that came back `is_error` or had every tool call
+refused isn't healthy even if its artifact happens to be present.
+
 `claude` kind additionally needs `PROMPT` (the slash command to run, e.g. `/dream` or
 `/cron-health --dry-run`). `script` kind needs `SCRIPT` (a command run from the repo root
 under `bash -o pipefail -c`, e.g. `scripts/foo.sh` or `python3 scripts/foo.py`).
