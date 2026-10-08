@@ -1,6 +1,6 @@
 {
   "autoMemoryDirectory": "~/projects/trellis-knowledge/memory",
-  "autoCompactWindow": 800000,
+  "autoCompactWindow": 500000,
   "env": {
     "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
   },
