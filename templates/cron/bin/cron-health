@@ -343,10 +343,9 @@ def update_alerts_doc(failing, now_dt, dry_run):
     if os.path.exists(KB_PUSH):
         subprocess.run([KB_PUSH], check=True, cwd=KB_DIR)
     else:
-        # No force, no push.default surprises: push exactly the current branch (HEAD) to its
-        # already-configured upstream. check=True means a failure (including "no upstream")
-        # raises and exits non-zero instead of failing silently.
-        subprocess.run(["git", "-C", KB_DIR, "push", "HEAD"], check=True)
+        # No force, no push.default surprises: push exactly the current branch to the same-named
+        # branch on origin. check=True means a failure raises and exits non-zero, never silently.
+        subprocess.run(["git", "-C", KB_DIR, "push", "origin", "HEAD"], check=True)
     return True
 
 
