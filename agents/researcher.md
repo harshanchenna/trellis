@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: "Use when gathering information from external sources (web, papers, news, financial data, community discussion) that would bloat main context. Handles multi-source research, data fetching via MCP tools, and trend scanning. NOT for quick 1-2 source lookups — do those inline."
-model: sonnet
+model: haiku
 tools: Read, Write, Glob, Grep, Bash, WebFetch, WebSearch, TodoWrite
 ---
 
