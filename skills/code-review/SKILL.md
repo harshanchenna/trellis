@@ -24,7 +24,8 @@ Parse arguments for depth. Default is **standard**.
 
 **Model usage:**
 - Pre-check, context gathering, PR summarizer: **Haiku**
-- Compliance, bug detection, logic/security, and validation agents: **Sonnet**
+- Compliance agent 1, bug detection, logic/security, and validation agents: **Sonnet**
+- Compliance agent 2: **Haiku** (a second model on the redundant pair catches what one model's blind spots miss, at low cost)
 
 **Severity levels:**
 - **Critical**: Will break production, security vulnerability, data loss. Blocks merge.
@@ -56,16 +57,16 @@ Return the actual text (or the relevant excerpts) — the orchestrator will past
 
 Return: PR title and description, files changed with brief purpose, overall intent.
 
-## Step 4: Parallel review (4 sonnet agents)
+## Step 4: Parallel review (3 sonnet agents, 1 haiku agent)
 
 Launch 4 agents in parallel. Each returns a list of issues with: file path and line number(s), description, and reason flagged (e.g. "convention violation", "bug", "logic error", "security"). Give every agent the PR title/description and the diff.
 
-### Agents 1 + 2: Convention compliance (sonnet agents, redundant pair)
+### Agents 1 + 2: Convention compliance (redundant pair: agent 1 sonnet, agent 2 haiku)
 Give both agents the AGENTS.md/CLAUDE.md text gathered in Step 2 verbatim, plus the diff. Audit changes against it. Only flag a violation when the file being checked is covered by that convention file's scope (same path or a parent directory).
 
 **If the PR modifies `skills/code-review/` or `skills/design-review/`**: review it using the procedure as it exists on the base branch (`git show origin/<base>:skills/code-review/SKILL.md`), never the PR's own version, and state in the output that the PR changes the review gate, so the user merges it. Make the same statement, naming the lane `AGENTS.md`'s **Merging** section reserves for the user, for any PR in that lane: it changes that paragraph, removes or loosens an invariant, widens the agent's access (`.mcp.json` servers or commands, `enabledMcpjsonServers`, `permissions`, hooks), or is a major re-architecture.
 
-**If the PR modifies `AGENTS.md` or `CLAUDE.md`**: give one of the two compliance agents the base-branch and PR-branch versions side by side and have it list every invariant or rule that was removed, loosened, narrowed in scope, or given a new exception, quoting before and after. Each one is reported at **Important** or higher, even if intended, so the user sees it called out rather than buried in a diff. This matters most for `/self-improve` PRs.
+**If the PR modifies `AGENTS.md` or `CLAUDE.md`**: give compliance agent 1 (the Sonnet one) the base-branch and PR-branch versions side by side and have it list every invariant or rule that was removed, loosened, narrowed in scope, or given a new exception, quoting before and after. Each one is reported at **Important** or higher, even if intended, so the user sees it called out rather than buried in a diff. This matters most for `/self-improve` PRs.
 
 ### Agent 3: Bug detection (sonnet agent)
 Scan for bugs **introduced in this diff only**, from the diff alone (no extra context). Severity as above. Don't flag anything that can't be validated from the diff.
