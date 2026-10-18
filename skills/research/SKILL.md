@@ -64,7 +64,7 @@ Record each outcome (approved / approved-with-edits / pivoted / skipped, with no
 ### Execution
 
 - Track stage progress with your task list so a multi-stage sprint doesn't lose state mid-way.
-- Launch parallel `researcher` agents in a single message, 2-4 per stage — each with a clearly scoped, non-overlapping question and an output tier. More than 4 adds coordination overhead without proportional benefit.
+- Launch parallel `researcher` agents in a single message, 2-4 per stage — each with a clearly scoped, non-overlapping question and an output tier. Pass `model: "sonnet"` on sprint dispatches if `researcher` defaults to a lighter model: sprint sub-tasks carry the heavy synthesis and source grading that need the stronger model. More than 4 adds coordination overhead without proportional benefit.
 - Adaptive depth: go deeper where findings are rich or contradictory, lighter where they're settled. If a stage reveals the topology itself was wrong, stop and re-architect — note the pivot and why.
 - Between stages, check: did this stage produce what the next one needs? Any gap that would undermine downstream stages? If a gate fails, retry with a different angle or proceed with the gap explicitly noted.
 
